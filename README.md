@@ -1,8 +1,20 @@
-# CAGE-CareRF GNN — YelpZip 사기 리뷰 탐지
+# CAGE-CareRF GNN — YelpZip 사기 리뷰 탐지 · **TF-IDF ⊕ SBERT concat 텍스트 인코더 변형**
 
 > **CAGE-RF + CARE** — Camouflage-Aware Gated Edge Relation-Fusion GNN
 > ITDA Networking Day 2026 예선 코드 (Team C)
-> **FINAL**: CAGE-RF + CARE — Test PR-AUC **0.4447 ± 0.0061** (15모델 중 1위, std 최소)
+> **FINAL backbone**: CAGE-RF + CARE — Test PR-AUC **0.4447 ± 0.0061** (TF-IDF 단독 인코더 기준, 15모델 중 1위)
+
+> ### 🔖 이 repo의 정체성 — 인코더 fusion 변형 (concat **후**)
+> frozen-SBERT 단독이 TF-IDF 대비 PR-AUC에서 손해(주력 모델 −0.0135)였던 한계를,
+> **두 인코더를 합쳐** 보완하는 변형. `TEXT_ENCODER` 환경변수로 선택:
+> - **`concat`** (본 repo의 주제) — TF-IDF→SVD128 ⊕ frozen-SBERT→SVD128, 모달리티별 train-only z-score 후 concat(256) → **공동 train-only SVD 128**
+> - `sbert` — frozen SBERT → SVD 128 (concat 전 변형, 별도 repo `CARE-RF-GNN_With_BERT`)
+> - `tfidf` — 기존 TF-IDF → SVD 128 (원 FINAL 인코더)
+>
+> 셋 다 최종 128차원으로 끝나 downstream(그래프/CARE/모델)이 **byte-for-byte 동일** → 인코더만의 효과를 깨끗이 비교.
+>
+> **설계 의도**: TF-IDF의 도메인 변별 토큰(lexical 정밀도) + SBERT의 의미·동의어 표현을 결합해
+> 각 인코더 단독의 약점을 상호 보완. 공동 SVD로 차원을 128로 되돌려 기존 결과들과 apples-to-apples 유지.
 
 YelpZip 리뷰를 노드로 두고 6개 relation(기본 3 + 커스텀 3)으로 그래프를 구성한 뒤, CARE-GNN의 camouflage-resistant neighbor filtering + Skip GNN branch + Gated Relation Fusion + Auxiliary branch loss를 결합한 다중 관계 GNN.
 
@@ -57,8 +69,8 @@ mkdir -p data/raw
 python -m src.preprocessing.load_yelpzip
 python -m src.preprocessing.label_convert       # -1 → 1, 1 → 0
 python -m src.preprocessing.sampling            # 결정론적 이분 탐색 임계값
-python -m src.preprocessing.feature_engineering # train-only fit
-python -m src.graph.build_relations             # 6개 relation 빌드
+TEXT_ENCODER=concat python -m src.preprocessing.feature_engineering  # TF-IDF ⊕ SBERT (sbert/tfidf 도 가능)
+python -m src.graph.build_relations             # 6개 relation 빌드 (위 인코더 산출물 기반)
 python -m src.graph.relation_quality            # fraud_edge_lift 산출
 
 # 5) 학습 — FINAL 단일 실행
@@ -68,6 +80,43 @@ python -m src.training.train --model cage_rf_gnn_cheb \
 # 6) 학습 — 15 × 5 = 75회 (학회 표준, 권장)
 python 5x_run_all_models.py
 ```
+
+---
+
+## 2-b. concat 인코더 실행 (이 repo 핵심)
+
+```bash
+# TF-IDF ⊕ SBERT concat — SBERT 1회 인코딩 후 data/interim 캐시, 이후 재사용
+TEXT_ENCODER=concat python -m src.preprocessing.feature_engineering
+# 인코더 바꾼 뒤 relation 재빌드 필수 (텍스트 임베딩 [:, :128] 기반)
+python -m src.graph.build_relations && python -m src.graph.relation_quality
+# 검증 — text_encoder=concat 떠야 정상
+python -c "import json,sys;m=json.load(open('data/processed/feature_meta.json'));print(m.get('text_encoder'), m['num_features'])"
+# 15모델 × 5 seeds
+python 5x_run_all_models.py
+```
+
+### concat 파이프라인 (leakage-safe)
+
+```text
+TF-IDF(vocab) ──train-only SVD──▶ 128 ──┐
+                                         ├─ train-only z-score ─▶ concat (256) ──train-only SVD──▶ 128 ─▶ (+ numeric 12) = 140D
+frozen SBERT(384) ─train-only SVD─▶ 128 ─┘
+```
+
+- 모든 fit(SVD·StandardScaler·TF-IDF)은 `split=='train'` 행에서만, SBERT는 frozen(미세조정 X) → leakage-safe.
+- 모달리티별 z-score 후 합쳐서 공동 SVD → TF-IDF의 큰 특이값 스케일이 SBERT 채널을 압도하지 않도록 함.
+- 최종 텍스트 차원 128 유지 → `sbert`/`tfidf` 단독 실행과 모델·그래프 입력이 동일 (apples-to-apples).
+
+### 인코더별 비교 (실측은 본 repo 75회 실행 후 갱신)
+
+| 인코더 | 동기 | 비고 |
+|---|---|---|
+| `tfidf` | 도메인 변별 토큰 보존 | 원 FINAL, PR-AUC 최고 기준선 |
+| `sbert` | 의미·동의어 표현 | 단독 시 PR-AUC −0.0044(평균)~−0.0135(주력) — 별도 repo 참조 |
+| **`concat`** | **둘의 약점 상호 보완** | **본 repo — 결과 산출 후 이 표 갱신 예정** |
+
+> concat은 SBERT 단독의 "도메인 토큰 희석"을 TF-IDF lexical anchor로 메우고, TF-IDF의 "의미 무지"를 SBERT로 보완하는 것이 목표. frozen 한계(도메인 미적응) 자체는 남으므로, 추가 개선은 학습 가능한 projection / SBERT fine-tune이 다음 수순.
 
 ---
 
@@ -168,7 +217,7 @@ python 5x_run_all_models.py --dry-run
 ## 5. FINAL 모델 개요 — CAGE-RF + CARE
 
 ```text
-Reviews (N=47,125, F=140 = TF-IDF→SVD 128 + numeric 12)
+Reviews (N=47,125, F=140 = [concat: TF-IDF⊕SBERT]→SVD 128 + numeric 12)
     │
     ▼   [offline] CARE neighbor filter (feature cosine top-k, label-free)
 6 relation graphs (basic R-U-R / R-T-R / R-S-R + 커스텀 R-Burst-R / R-SemSim-R / R-Behavior-R)
@@ -253,7 +302,7 @@ PR-AUC 내림차순. 출처: `outputs/multi_seed_summary.json`.
 - **샘플** (결정론적 이분 탐색): **47,125 nodes** (Train 30,160 / Valid 7,540 / Test 9,425)
 - **샘플 fraud_ratio**: 11.16% (Train/Valid/Test 모두 동일, stratified)
 - **임계값**: `head_pu = 6` (상품·사용자 공통), `head_m = 1` (월) → union 자연스럽게 ≤ 50,000
-- **Feature**: 140D = 128 (TF-IDF→SVD) + 12 (numeric), train-only fit
+- **Feature**: 140D = 128 (텍스트→SVD; `TEXT_ENCODER`=concat(기본)|sbert|tfidf) + 12 (numeric), train-only fit
 
 ### 6 Relations 도메인 가설 vs 실측
 
