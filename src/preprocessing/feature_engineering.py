@@ -13,8 +13,12 @@ CONFIG = {
     "processed_dir": "data/processed",
     "interim_dir": "data/interim",
     "input_file": "sampled_reviews.csv",
-    # Text encoder: "sbert" (Option A: SBERT -> train-only SVD 128) or "tfidf"
-    # (original TF-IDF -> SVD 128). Override at runtime via env TEXT_ENCODER.
+    # Text encoder, override at runtime via env TEXT_ENCODER:
+    #   "sbert"  — Option A: frozen SBERT -> train-only SVD 128
+    #   "tfidf"  — original TF-IDF -> train-only SVD 128
+    #   "concat" — TF-IDF->SVD128 ⊕ SBERT->SVD128, per-modality train-only
+    #              z-score, then a joint train-only SVD back to 128 (so the
+    #              downstream dim stays apples-to-apples with the two above).
     "text_encoder": os.environ.get("TEXT_ENCODER", "sbert"),
     "sbert_model": os.environ.get("SBERT_MODEL", "all-MiniLM-L6-v2"),
     "sbert_batch_size": 256,
@@ -49,7 +53,11 @@ def extract_text_embedding(df):
         return _extract_tfidf_svd(df)
     if encoder == "sbert":
         return _extract_sbert_svd(df)
-    raise ValueError(f"Unknown text_encoder: {encoder!r} (use 'sbert' or 'tfidf')")
+    if encoder == "concat":
+        return _extract_concat_svd(df)
+    raise ValueError(
+        f"Unknown text_encoder: {encoder!r} (use 'sbert', 'tfidf' or 'concat')"
+    )
 
 
 def _extract_tfidf_svd(df):
@@ -159,6 +167,70 @@ def _extract_sbert_svd(df):
     return text_embeddings, None, svd
 
 
+def _extract_concat_svd(df):
+    """TF-IDF ⊕ SBERT fusion, ending in a train-only SVD back to 128 dims.
+
+    Each modality is first reduced by its own train-only SVD(128), then
+    z-scored on train rows (so the joint SVD is not dominated by TF-IDF's
+    larger singular-value scale), concatenated to 256, and finally compressed
+    by one more train-only SVD to 128. Net effect: same downstream
+    text_embedding_dim as the 'tfidf' / 'sbert' single-encoder runs, so the
+    model/relations/CARE pipeline is byte-for-byte unchanged and the encoder
+    comparison stays apples-to-apples. Leakage-safe: every fit is train-only;
+    SBERT itself is frozen pretrained (never fit).
+    """
+    print("[Feature] 텍스트 임베딩 — CONCAT(TF-IDF ⊕ SBERT) "
+          "-> 공동 SVD (train-only fit)...")
+
+    train_mask = _train_mask(df)
+    n_comp = CONFIG["svd_components"]
+
+    # --- branch A: TF-IDF -> train-only SVD(n_comp) ---
+    texts = df["text"].fillna("").values
+    vectorizer = TfidfVectorizer(
+        max_features=CONFIG["tfidf_max_features"],
+        min_df=CONFIG["tfidf_min_df"],
+        max_df=CONFIG["tfidf_max_df"],
+        ngram_range=CONFIG["tfidf_ngram"],
+        lowercase=True,
+        token_pattern=r"\b\w+\b",
+    )
+    vectorizer.fit(texts[train_mask])
+    tfidf_matrix = vectorizer.transform(texts)
+    svd_tfidf = TruncatedSVD(n_components=n_comp, random_state=CONFIG["random_state"])
+    svd_tfidf.fit(tfidf_matrix[train_mask])
+    emb_tfidf = svd_tfidf.transform(tfidf_matrix)
+    print(f"  TF-IDF block: vocab={len(vectorizer.vocabulary_)}, "
+          f"SVD{n_comp} EVR={svd_tfidf.explained_variance_ratio_.sum():.4f}")
+
+    # --- branch B: frozen SBERT -> train-only SVD(n_comp) ---
+    sbert_raw = _encode_sbert(df)  # pretrained frozen, NOT fit on any split
+    nb = min(n_comp, sbert_raw.shape[1] - 1)
+    svd_sbert = TruncatedSVD(n_components=nb, random_state=CONFIG["random_state"])
+    svd_sbert.fit(sbert_raw[train_mask])
+    emb_sbert = svd_sbert.transform(sbert_raw)
+    print(f"  SBERT block: dim={sbert_raw.shape[1]}, "
+          f"SVD{nb} EVR={svd_sbert.explained_variance_ratio_.sum():.4f}")
+
+    # --- per-modality train-only z-score, then concat to (N, 2*n_comp) ---
+    sc_a = StandardScaler().fit(emb_tfidf[train_mask])
+    sc_b = StandardScaler().fit(emb_sbert[train_mask])
+    fused = np.concatenate(
+        [sc_a.transform(emb_tfidf), sc_b.transform(emb_sbert)], axis=1
+    )
+    print(f"  Fused (pre-joint-SVD): {fused.shape}")
+
+    # --- joint train-only SVD back to n_comp (apples-to-apples dim) ---
+    svd = TruncatedSVD(n_components=n_comp, random_state=CONFIG["random_state"])
+    svd.fit(fused[train_mask])
+    text_embeddings = svd.transform(fused)
+    print(f"  Joint SVD fit on {int(train_mask.sum())} train rows. "
+          f"Final emb: {text_embeddings.shape}, "
+          f"EVR={svd.explained_variance_ratio_.sum():.4f}")
+
+    return text_embeddings, vectorizer, svd
+
+
 def extract_numeric_features(df):
     print("\n[Feature] 정형 Feature 추출...")
 
@@ -240,6 +312,13 @@ def save_features(df, combined_features):
             f"(사전학습 임베딩 캐시 동봉). SVD/StandardScaler는 split=='train' 행에서만 fit, "
             f"그 외 transform-only."
         )
+    elif encoder == "concat":
+        fit_note = (
+            f"CONCAT(TF-IDF ⊕ SBERT('{CONFIG['sbert_model']}') frozen). 모달리티별 "
+            f"SVD128 후 train-only z-score → concat(256) → 공동 SVD128. SBERT는 "
+            f"어떤 split에도 fit/finetune 안 함; TF-IDF/모든 SVD/StandardScaler는 "
+            f"split=='train' 행에서만 fit, 그 외 transform-only."
+        )
     else:
         fit_note = "TF-IDF/SVD/StandardScaler 모두 split=='train' 행에서만 fit, 그 외 transform-only"
 
@@ -249,7 +328,9 @@ def save_features(df, combined_features):
         "text_embedding_dim": int(CONFIG["svd_components"]),
         "numeric_features_dim": int(combined_features.shape[1] - CONFIG["svd_components"]),
         "text_encoder": encoder,
-        "sbert_model": CONFIG["sbert_model"] if encoder == "sbert" else None,
+        "sbert_model": (
+            CONFIG["sbert_model"] if encoder in ("sbert", "concat") else None
+        ),
         "fit_scope": "train_only",
         "note": fit_note,
     }
