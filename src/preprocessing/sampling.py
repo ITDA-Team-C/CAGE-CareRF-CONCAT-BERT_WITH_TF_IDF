@@ -15,15 +15,25 @@ CONFIG = {
     "max_nodes": 50000,
     "random_state": 42,
     # 샘플링 전략:
-    #   "group_dense" : fraud-density × activity 점수 상위 그룹 선택
-    #                   → 자연스럽게 fraud 비율 ↑ (대회 주제 "조직적 어뷰징 탐지"와 정합)
+    #   "group_dense"    : fraud-density × activity 점수 상위 그룹 선택 (1-stage)
+    #   "cascade"        : group_dense → semantic filter → behavioral reseed (3-stage)
     #   "hybrid_uniform" : 활동량 top-N 만 보는 기존 방식 (fraud-blind)
-    "sampling_strategy": "group_dense",
-    # group_dense 전략의 신뢰 가능한 활동량 하한 (1~2회 활동 그룹의 density는 노이즈)
+    "sampling_strategy": "cascade",
+    # group_dense (= cascade Stage 1) 파라미터
     "min_group_activity": 3,
     "min_month_activity": 10,
-    # density 점수에서 활동량 가중을 cap 하는 상한 (한 그룹의 활동량 우위가 점수를 지배하지 않게)
     "activity_cap": 50,
+    # cascade Stage 2 (semantic filter) 파라미터
+    # Stage 1 의 글로벌 fraud 비율(~25%) 보다 충분히 높/낮은 클러스터만 차별 처리.
+    "cascade_s2_high_density": 0.40,    # 클러스터 fraud 밀도 이 이상 → 통째 유지 (high-signal)
+    "cascade_s2_low_density": 0.15,     # 이 미만 → low_keep_ratio 만큼 다운샘플 (likely noise)
+    "cascade_s2_low_keep_ratio": 0.3,   # low-density 클러스터의 30% 만 유지
+    "cascade_s2_noise_keep_ratio": 0.5,
+    "cascade_s2_min_cluster_size": 20,
+    # cascade Stage 3 (behavioral reseed) 파라미터
+    "cascade_s3_burst_window_days": 7,
+    "cascade_s3_burst_min_reviews": 5,
+    "cascade_s3_normal_recovery_ratio": 0.5,
 }
 
 
@@ -323,6 +333,24 @@ if __name__ == "__main__":
     print(f"\n[Strategy] sampling_strategy = '{strategy}'")
     if strategy == "group_dense":
         df = group_dense_sampling(df)
+    elif strategy == "cascade":
+        from src.sampling.cascade_pipeline import run_cascade
+        df = group_dense_sampling(df)  # Stage 1
+        df = run_cascade(               # Stage 2 + Stage 3
+            df,
+            s2_high_density=CONFIG["cascade_s2_high_density"],
+            s2_low_density=CONFIG["cascade_s2_low_density"],
+            s2_low_keep_ratio=CONFIG["cascade_s2_low_keep_ratio"],
+            s2_noise_keep_ratio=CONFIG["cascade_s2_noise_keep_ratio"],
+            s2_min_cluster_size=CONFIG["cascade_s2_min_cluster_size"],
+            s3_burst_window_days=CONFIG["cascade_s3_burst_window_days"],
+            s3_burst_min_reviews=CONFIG["cascade_s3_burst_min_reviews"],
+            s3_normal_recovery_ratio=CONFIG["cascade_s3_normal_recovery_ratio"],
+            random_state=CONFIG["random_state"],
+        )
+        # cascade 출력이 max_nodes 를 넘기지는 않는지 가드 (Stage 3 가 노드 복원하므로)
+        assert CONFIG["min_nodes"] <= len(df) <= CONFIG["max_nodes"], \
+            f"cascade 결과 노드 수 범위 초과: {len(df)}"
     elif strategy == "hybrid_uniform":
         df = product_user_time_hybrid_sampling(df)
     else:
