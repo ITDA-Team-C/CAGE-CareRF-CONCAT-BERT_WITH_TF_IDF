@@ -14,6 +14,16 @@ CONFIG = {
     "min_nodes": 10000,
     "max_nodes": 50000,
     "random_state": 42,
+    # 샘플링 전략:
+    #   "group_dense" : fraud-density × activity 점수 상위 그룹 선택
+    #                   → 자연스럽게 fraud 비율 ↑ (대회 주제 "조직적 어뷰징 탐지"와 정합)
+    #   "hybrid_uniform" : 활동량 top-N 만 보는 기존 방식 (fraud-blind)
+    "sampling_strategy": "group_dense",
+    # group_dense 전략의 신뢰 가능한 활동량 하한 (1~2회 활동 그룹의 density는 노이즈)
+    "min_group_activity": 3,
+    "min_month_activity": 10,
+    # density 점수에서 활동량 가중을 cap 하는 상한 (한 그룹의 활동량 우위가 점수를 지배하지 않게)
+    "activity_cap": 50,
 }
 
 
@@ -102,6 +112,125 @@ def product_user_time_hybrid_sampling(df):
     return sampled_df
 
 
+def _score_groups_by_fraud_density(df, group_col, min_activity, activity_cap):
+    """
+    그룹별 점수 = fraud_density × log1p(min(activity, activity_cap))
+
+    - fraud_density: 그룹 내 fraud 비율 (=조직적 어뷰징 신호의 강도)
+    - log1p(activity cap): 활동량이 충분해야 density 가 의미 있고,
+                          한두 그룹의 거대한 활동량이 점수를 지배하지 않게 cap
+    - min_activity 미만 그룹은 통계적 신뢰성이 낮아 후보에서 제외
+    """
+    g = df.groupby(group_col).agg(n=("label", "size"), n_fraud=("label", "sum"))
+    g = g[g["n"] >= min_activity].copy()
+    g["density"] = g["n_fraud"] / g["n"]
+    g["score"] = g["density"] * np.log1p(np.minimum(g["n"], activity_cap))
+    return g.sort_values(["score", "n"], ascending=[False, False])
+
+
+def group_dense_sampling(df):
+    """
+    Fraud-density 가 높은 (user / prod / time-window) 그룹을 우선 선택하는 서브그래프 샘플링.
+
+    - 그래프 연결성: 같은 그룹에 속한 리뷰들이 통째로 들어오므로 R-U-R, R-T-R 연결성 자연 보존
+    - Fraud 비율: 조직적 어뷰징 그룹을 우선 선택 → 자연스럽게 ↑ (강제 언더샘플링 아님)
+    - 대회 주제 "조직적 어뷰징 네트워크 탐지" 와 의미적으로 정합
+    """
+    print("[Sampling] Group-Dense (fraud-density × activity) Sampling 시작...")
+
+    df = add_temporal_features(df)
+
+    print(f"  총 데이터: {len(df)}")
+    print(f"  전체 fraud 비율: {(df['label']==1).mean():.4f}")
+    print(f"  상품 수: {df['prod_id'].nunique()}, 사용자 수: {df['user_id'].nunique()}")
+    print(f"  기간: {df['date'].min()} ~ {df['date'].max()}")
+
+    users_scored = _score_groups_by_fraud_density(
+        df, "user_id",
+        min_activity=CONFIG["min_group_activity"],
+        activity_cap=CONFIG["activity_cap"],
+    )
+    prods_scored = _score_groups_by_fraud_density(
+        df, "prod_id",
+        min_activity=CONFIG["min_group_activity"],
+        activity_cap=CONFIG["activity_cap"],
+    )
+    months_scored = _score_groups_by_fraud_density(
+        df, "year_month",
+        min_activity=CONFIG["min_month_activity"],
+        activity_cap=CONFIG["activity_cap"],
+    )
+
+    print(f"\n  [User] 상위 5 (fraud-density × activity):")
+    print(users_scored.head(5)[["n", "n_fraud", "density", "score"]])
+    print(f"\n  [Product] 상위 5:")
+    print(prods_scored.head(5)[["n", "n_fraud", "density", "score"]])
+    print(f"\n  [Month] 상위 5:")
+    print(months_scored.head(5)[["n", "n_fraud", "density", "score"]])
+
+    users_ranked = users_scored.index.to_numpy()
+    prods_ranked = prods_scored.index.to_numpy()
+    months_ranked = months_scored.index.to_numpy()
+
+    def _union_size(head_pu, head_m):
+        tp = set(prods_ranked[:head_pu])
+        tu = set(users_ranked[:head_pu])
+        tm = set(months_ranked[:head_m])
+        return int((
+            df["prod_id"].isin(tp)
+            | df["user_id"].isin(tu)
+            | df["year_month"].isin(tm)
+        ).sum())
+
+    # 기존 hybrid 와 같은 binary search 구조로 max_nodes 이하의 최대 head_pu 탐색
+    lo, hi = 1, max(2000, len(df) // 100)
+    best_head_pu = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        head_m_mid = max(1, mid // 20)
+        if _union_size(mid, head_m_mid) <= CONFIG["max_nodes"]:
+            best_head_pu = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    head_pu = best_head_pu
+    head_m = max(1, head_pu // 20)
+    top_users = set(users_ranked[:head_pu])
+    top_prods = set(prods_ranked[:head_pu])
+    top_months = set(months_ranked[:head_m])
+
+    print(f"\n  [Threshold-Search] head_pu={head_pu}, head_m={head_m}")
+    print(f"  상위 fraud-active User 선택: {len(top_users)}")
+    print(f"  상위 fraud-active Product 선택: {len(top_prods)}")
+    print(f"  상위 fraud-active Month 선택: {len(top_months)}")
+
+    product_mask = df["prod_id"].isin(top_prods)
+    user_mask = df["user_id"].isin(top_users)
+    month_mask = df["year_month"].isin(top_months)
+    sampled_df = df[product_mask | user_mask | month_mask].copy()
+
+    print(f"\n  Union (product OR user OR month): {len(sampled_df)}")
+
+    sampled_df = sampled_df.sort_values(
+        by=["prod_id", "user_id", "date"],
+        ascending=[True, True, True],
+        kind="mergesort",
+    )
+
+    fr = (sampled_df["label"] == 1).mean()
+    print(f"\n  최종 샘플: {len(sampled_df)}  |  자연스러운 fraud 비율: {fr:.4f}")
+    print(f"  목표: {CONFIG['target_nodes']}, 범위: [{CONFIG['min_nodes']}, {CONFIG['max_nodes']}]")
+
+    assert CONFIG["min_nodes"] <= len(sampled_df) <= CONFIG["max_nodes"], \
+        f"샘플 크기 범위 초과: {len(sampled_df)}"
+
+    sampled_df = sampled_df.reset_index(drop=True)
+    sampled_df["node_id"] = np.arange(len(sampled_df))
+
+    return sampled_df
+
+
 def train_val_test_split(df):
     print("\n[Split] Train/Valid/Test 분할...")
 
@@ -156,17 +285,28 @@ def save_sampled_data(df):
     print(f"\n[Save] {save_path}")
 
     stats_path = os.path.join(CONFIG["processed_dir"], "sampling_stats.txt")
+    fraud_ratio = float((df["label"] == 1).mean())
     with open(stats_path, "w", encoding="utf-8") as f:
         f.write("=== Sampling Statistics ===\n\n")
         f.write(f"Total sampled nodes: {len(df)}\n")
         f.write(f"Target: {CONFIG['target_nodes']}\n")
-        f.write(f"Range: [{CONFIG['min_nodes']}, {CONFIG['max_nodes']}]\n\n")
+        f.write(f"Range: [{CONFIG['min_nodes']}, {CONFIG['max_nodes']}]\n")
+        f.write(f"random_state: {CONFIG['random_state']}\n")
+        f.write(f"sampling_strategy: {CONFIG.get('sampling_strategy', 'group_dense')}\n")
+        f.write(f"actual_fraud_ratio: {fraud_ratio:.4f}\n\n")
 
         f.write("Label Distribution:\n")
         f.write(df["label"].value_counts().to_string() + "\n\n")
 
-        f.write("Split Distribution:\n")
+        f.write("Split Distribution (target 64/16/20):\n")
         f.write(df["split"].value_counts().to_string() + "\n\n")
+
+        f.write("Per-split Fraud Ratio:\n")
+        for sp in ["train", "valid", "test"]:
+            sub = df[df["split"] == sp]
+            if len(sub) > 0:
+                f.write(f"  {sp}: n={len(sub)}, fraud={(sub['label']==1).mean():.4f}\n")
+        f.write("\n")
 
         f.write("Unique values:\n")
         f.write(f"Products: {df['prod_id'].nunique()}\n")
@@ -179,7 +319,15 @@ if __name__ == "__main__":
     input_path = os.path.join(CONFIG["interim_dir"], "labeled_data.csv")
     df = pd.read_csv(input_path)
 
-    df = product_user_time_hybrid_sampling(df)
+    strategy = CONFIG.get("sampling_strategy", "group_dense")
+    print(f"\n[Strategy] sampling_strategy = '{strategy}'")
+    if strategy == "group_dense":
+        df = group_dense_sampling(df)
+    elif strategy == "hybrid_uniform":
+        df = product_user_time_hybrid_sampling(df)
+    else:
+        raise ValueError(f"unknown sampling_strategy: {strategy}")
+
     df = train_val_test_split(df)
     save_sampled_data(df)
 
