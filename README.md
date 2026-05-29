@@ -92,22 +92,29 @@ python 5x_run_all_models.py
 ## 5. concat 인코더 구현
 
 ```text
-text → TF-IDF (vocab 50k, ngram 1-2)
-     → TruncatedSVD-128 [train-only fit]                ┐
-                                                         │
-                                                         │ 모달리티별
-                                                         │ train-only
-                                                         │ z-score
-                                                         │
-text → frozen SBERT 384D (no_grad, 1회 캐시)              │
-     → TruncatedSVD-128 [train-only fit]                ┘
-                            │
-                            ▼ concat (256D)
-                            │
-                            ▼ joint TruncatedSVD-128 [train-only fit]
-                            text_emb (128D)
-                            ⊕ numeric context 12D
-                            = Node Feature 140D
+.
+├── src/
+│   ├── preprocessing/   load_yelpzip / label_convert / sampling / feature_engineering
+│   ├── sampling/        cascade_pipeline / hdbscan_stratified_split / grouped_stratified_split
+│   ├── graph/           build_{rur,rtr,rsr,burst,semsim,behavior,relations,relation_quality}
+│   ├── filtering/       care_neighbor_filter
+│   ├── models/          baseline_{mlp,gcn,gat,graphsage,cheb,tag} / cage_rf_gnn_cheb /
+│   │                    skip_cheb_branch / gated_relation_fusion / cage_carerf_gnn /
+│   │                    text_projection_wrapper / losses
+│   ├── training/        train / evaluate / threshold /
+│   │                    lgbm_stacking / stacked_ensemble / aggregate_final
+│   └── utils/           seed / io / metrics
+├── configs/             default, v8_skip, v9_twostage, cage_rf_skip_care,
+│                        cage_carerf{,_lean,_lean_5}, ablation_no_{skip,gating,aux,custom}
+├── amazon/              참고 데이터셋: Amazon — 7모델 × 5 seeds
+├── yelchi/              참고 데이터셋: YelpChi — 7모델 × 5 seeds
+├── docs/                01_code_structure / 02_training_pipeline / 03_model_architecture /
+│                        04_setup_and_run
+├── run_all_models.py            YelpZip 단일 seed launcher
+├── 5x_run_all_models.py         YelpZip 15 × 5 = 75회 launcher
+├── run_proj_experiments.py      Linear projection 변형 2 × 5 = 10회 launcher
+├── run_all_amazon.py            Amazon 7모델 launcher
+└── run_all_yelchi.py            YelpChi 7모델 launcher
 ```
 
 - SBERT 본체는 **frozen** — 어떤 split에도 fit/finetune 안 함
@@ -125,6 +132,128 @@ text → frozen SBERT 384D (no_grad, 1회 캐시)              │
 
 ---
 
-## 7. 라이선스 / 팀
+## 8. 예선 규정 준수 요약
+
+- Node = Review 유지 (분류 타깃 = 리뷰, 단일 노드 타입 homogeneous 그래프)
+- YelpZip 원본 → 결정론적 이분 탐색 임계값 샘플링 → 47,125 노드 → 64/16/20 stratified split (`random_state=42`)
+- **무작위 추출 0건** (`df.sample` / `np.random.choice` / `rng.choice` / `np.random.default_rng` 모두 `src/` 에 없음)
+- 라벨 변환 `-1→1, 1→0` (`src/preprocessing/label_convert.py`)
+- 기본 relation 3 + 커스텀 relation 3 = 6 relations, 모두 결정론적 top-k 또는 threshold 적용
+- TF-IDF/SVD/Scaler **train-only fit** (leakage-safe), SBERT는 frozen
+- relation quality 계산 시 train labels only
+- threshold 는 valid PR-curve에서 결정, **test set 은 1회만 평가**
+- PR-AUC / Macro F1 / G-Mean / ROC-AUC / Precision / Recall / Accuracy 모두 저장
+- 학회 표준 **multi-seed (5개) 평균 ± std** 보고
+
+---
+
+## 9. 도메인 일반화 — Cross-dataset 검증 (참고)
+
+동일 backbone(CAGE-RF + CARE)을 다른 fraud 도메인에 이식한 결과 (5 seeds 평균):
+
+| 데이터셋 | 제안 모델 | 최고 baseline | PR-AUC (제안) | PR-AUC Δ |
+|---|---|---|:---:|:---:|
+| YelpZip (메인) | CAGE-RF + CARE | ChebConv | 0.4447 | +0.1696 |
+| Amazon | CAGE-CareRF | MLP | 0.8162 | -0.0041 |
+| YelpChi | CAGE-CareRF | GraphSAGE | 0.7114 | +0.0936 |
+
+큰 재설계 없이 다른 fraud 도메인으로 이식 가능. 자세한 표는 `amazon/` 및 `yelchi/` 폴더 참조.
+
+---
+
+## 10. 본선 확장 — Behavioral Stacking & Meta-Ensemble
+
+본 섹션은 본선 단계에서 추가된 *후속 실험* 으로, FINAL GNN 의 출력을 **트리 기반 학습기 3종 (LightGBM · XGBoost · CatBoost) 의 행동 피처 모델** 과 결합하여 한 단계 더 성능 마진을 짜내는 stacking 파이프라인이다. 위 1~5 섹션의 공식 FINAL 결과 (`PR-AUC 0.4439 ± 0.0152`) 는 변경되지 않는다.
+
+### 10-1. 누수 차단 — 모든 aggregate 는 train 만으로 계산
+
+```python
+# src/training/lgbm_stacking.py  (build_features)
+train_df = df.loc[train_mask].copy()
+user_agg = _user_aggregates(train_df)   # train 만 사용
+prod_agg = _prod_aggregates(train_df)   # train 만 사용
+# valid/test 행은 user_id / prod_id 로 *train aggregate* 만 조회
+# train 에 없던 user/prod 는 NaN → 0 + unseen_in_train 별도 flag
+```
+
+YelpZip fraud 탐지에서 흔히 보이는 `user_fraud_rate` / `prod_fraud_rate` 류의 **전역 집계 leakage** 를 구조적으로 차단. 본 파이프라인 결과는 hold-out test 에 대해 재현 가능한 수치임을 보장한다.
+
+### 10-2. 행동 피처 구성 (총 32개)
+
+| 그룹 | 피처 |
+|---|---|
+| **self** | rating, rating_is_extreme, text_len, n_words, n_exclaim, n_question, caps_ratio, avg_word_len, ttr, dow, month, year |
+| **user_agg** (train only) | n_reviews, rating_{mean,std}, rating_extreme_ratio, text_len_{mean,std}, unique_prods, review_per_prod, unseen_in_train |
+| **prod_agg** (train only) | n_reviews, rating_{mean,std,skew}, extreme_ratio, unique_users, review_per_user, unseen_in_train |
+| **burst** | 같은 prod 의 ±7일 윈도우 안의 리뷰 수 (binary-search O(N log N)) |
+| **relative** | rating − user_mean, rating − prod_mean, text_len − user_mean |
+
+### 10-3. 아키텍처 — 2-Level Stacking
+
+```text
+                   ┌─────────────────────────┐
+                   │  Behavioral Features    │
+                   │  (32 cols, train-only)  │
+                   └────────────┬────────────┘
+                                │
+        ┌───────────────┬───────┴───────┬───────────────┐
+        ▼               ▼               ▼               ▼
+   ┌────────┐     ┌──────────┐    ┌──────────┐    ┌────────┐
+   │ LGBM   │     │ XGBoost  │    │ CatBoost │    │  GNN   │ ← saved npy
+   │ Level1 │     │ Level1   │    │ Level1   │    │ FINAL  │
+   └───┬────┘     └────┬─────┘    └────┬─────┘    └───┬────┘
+       │               │               │               │
+       └───────────────┴────┬──────────┴───────────────┘
+                            ▼
+                  ┌──────────────────────┐
+                  │  Level-2 Meta-Learner│
+                  │  Logistic Regression │  ← valid 에서만 학습
+                  │   (4 prob inputs)    │
+                  └──────────┬───────────┘
+                             ▼
+                       Test PR-AUC / Macro-F1
+```
+
+- **Level 1**: 네 모델 각각 *독립* 학습. LGBM/XGB/Cat 은 같은 32D 행동 피처 사용, GNN 은 이미 학습된 5-seed 결과의 `probs_*_seed{N}.npy` 를 로드.
+- **Level 2**: Logistic Regression 메타 학습기가 `[lgbm_v, xgb_v, cat_v, gnn_v]` 4개 확률을 입력으로 받아 *valid 에서만* 학습 (test 한 번도 미접촉). 가중치는 base learner 별 신뢰도를 *피처 별로* 학습하므로 단순 weighted average 보다 정교.
+- **Alternate**: `--meta xgb` 옵션으로 얕은 XGBoost (max_depth=3) 메타 학습기 대안 제공.
+
+### 10-4. 실행
+
+```bash
+# 의존성 (한 번만)
+pip install lightgbm xgboost catboost hdbscan
+
+# (선행) FINAL GNN 5-seed 학습 — probs_*_seed{N}.npy 자동 저장
+python -m src.training.train --model cage_rf_gnn_cheb \
+    --config configs/cage_rf_skip_care.yaml --seed 42   # 42, 123, 2024, 7, 1234
+
+# 단순 weighted blend (LGBM only + GNN, 5 seeds)
+python -m src.training.lgbm_stacking --seed 42 \
+    --gnn-probs-valid outputs/benchmark/CHEB/probs_valid_seed42.npy \
+    --gnn-probs-test  outputs/benchmark/CHEB/probs_test_seed42.npy
+
+# Level-2 meta-ensemble (LGBM + XGB + Cat + GNN, 5 seeds)
+python -m src.training.stacked_ensemble --seed 42 \
+    --gnn-probs-valid outputs/benchmark/CHEB/probs_valid_seed42.npy \
+    --gnn-probs-test  outputs/benchmark/CHEB/probs_test_seed42.npy
+
+# 5-seed 통합 리포트 (GNN / LGBM-only / Blend / Meta 한 표)
+python -m src.training.aggregate_final
+```
+
+### 10-5. 보조 — Cascade Sampling Pipeline (`src/sampling/`)
+
+본선 단계 부수 산출물. 기존 *fraud-blind* hybrid sampling 대비 **자연스럽게 fraud 비율을 25%+ 로 끌어올리는** 3-stage 캐스케이드를 제공한다 (`src/preprocessing/sampling.py` CONFIG 의 `sampling_strategy` 로 선택):
+
+1. **`group_dense`** — fraud-density × log-activity 점수 상위 (user / prod / month) 그룹 선택
+2. **`cascade`** — (1) → HDBSCAN semantic 필터링 → R-U-R / burst window 기반 normal reseed (그래프 연결성 회복)
+3. 보조 분할 도구: `hdbscan_stratified_split` (의미 군집 + 라벨 동시 stratify), `grouped_stratified_split` (StratifiedGroupKFold, shuffle / time_ordered 모드)
+
+공식 FINAL 결과 (`PR-AUC 0.4439`) 는 기존 hybrid sampling 기준이며, 본 캐스케이드는 본선 분석·실험용으로 분리해 둔다.
+
+---
+
+## 11. 라이선스 / 팀
 
 ITDA Team UnivConcat — 2026 ITDA Networking Day 학술제 본선 제출용.
