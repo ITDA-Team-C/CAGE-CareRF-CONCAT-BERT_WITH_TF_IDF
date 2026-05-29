@@ -473,6 +473,15 @@ def train(model_name, config_path, seed=DEFAULT_SEED):
     torch.save(best_model_state, model_path)
     print(f"\n[Save] {model_path}")
 
+    # LGBM stacking 용 valid/test 확률 저장 (probs_*_seed{N}.npy).
+    # lgbm_stacking 모듈이 --gnn-probs-valid/test 로 이 파일을 읽어 blend 수행.
+    probs_valid_path = os.path.join(output_dir, f"probs_valid{seed_suffix}.npy")
+    probs_test_path = os.path.join(output_dir, f"probs_test{seed_suffix}.npy")
+    np.save(probs_valid_path, valid_scores[valid_mask_np])
+    np.save(probs_test_path, test_scores[test_mask_np])
+    print(f"[Save] {probs_valid_path}")
+    print(f"[Save] {probs_test_path}")
+
     metrics_dict = {
         "model": model_name,
         "seed": seed,
